@@ -340,3 +340,196 @@ export function readBoxFraming(boxInput, mapSize, options = {}) {
   }
   return { pan, zoom };
 }
+
+/**
+ * Cubic ease-in-out curve.
+ * @param {number} t
+ * @returns {number}
+ */
+export function easeInOutCubic(t) {
+  const clamped = THREE.MathUtils.clamp(t, 0, 1);
+  if (clamped < 0.5) {
+    return 4 * clamped * clamped * clamped;
+  }
+  return 1 - Math.pow(-2 * clamped + 2, 3) / 2;
+}
+
+/**
+ * Interpolates camera pan and zoom from start state to target framing using cubic easing.
+ * @param {{ pan: THREE.Vector3; zoom: number }} start
+ * @param {{ pan: THREE.Vector3; zoom: number }} target
+ * @param {number} t Progress from 0 to 1
+ * @returns {{ pan: THREE.Vector3; zoom: number; progress: number; eased: number }}
+ */
+export function interpolateCameraState(start, target, t) {
+  const clamped = THREE.MathUtils.clamp(t, 0, 1);
+  const eased = easeInOutCubic(clamped);
+  const pan = new THREE.Vector3(
+    THREE.MathUtils.lerp(start.pan.x, target.pan.x, eased),
+    THREE.MathUtils.lerp(start.pan.y, target.pan.y, eased),
+    THREE.MathUtils.lerp(start.pan.z, target.pan.z, eased),
+  );
+  const zoom = THREE.MathUtils.lerp(start.zoom, target.zoom, eased);
+  return { pan, zoom, progress: clamped, eased };
+}
+
+/**
+ * Reads framing from either an existing { pan, zoom } object or a bounding box.
+ * @param {any} targetBounds
+ * @param {THREE.Vector3} mapSize
+ * @param {{ isWorldUnits?: boolean }} [options]
+ * @returns {{ pan: THREE.Vector3; zoom: number }}
+ */
+export function readTargetFraming(targetBounds, mapSize, options = {}) {
+  if (!targetBounds) {
+    return { pan: new THREE.Vector3(0, 0, 0), zoom: 1 };
+  }
+  if (targetBounds.pan && typeof targetBounds.zoom === "number") {
+    let panZ = 0;
+    if (targetBounds.pan.z !== undefined) {
+      panZ = targetBounds.pan.z;
+    }
+    return {
+      pan: new THREE.Vector3(targetBounds.pan.x, targetBounds.pan.y, panZ),
+      zoom: targetBounds.zoom,
+    };
+  }
+  return readBoxFraming(targetBounds, mapSize, options);
+}
+
+/**
+ * Extracts a normalized { pan, zoom } representation from camera, orbit, or state object.
+ * @param {any} from
+ * @returns {{ pan: THREE.Vector3; zoom: number }}
+ */
+function extractCameraState(from) {
+  if (!from) {
+    return { pan: new THREE.Vector3(0, 0, 0), zoom: 1 };
+  }
+  if (from.pan && typeof from.zoom === "number") {
+    let panZ = 0;
+    if (from.pan.z !== undefined) {
+      panZ = from.pan.z;
+    }
+    return {
+      pan: new THREE.Vector3(from.pan.x, from.pan.y, panZ),
+      zoom: from.zoom,
+    };
+  }
+  if (from.orbit && from.zoomState) {
+    return {
+      pan: from.orbit.pan.clone(),
+      zoom: from.zoomState.current,
+    };
+  }
+  return { pan: new THREE.Vector3(0, 0, 0), zoom: 1 };
+}
+
+/**
+ * Resolves current timestamp provider without ternary operator.
+ * @param {(() => number) | undefined} customGetTime
+ * @returns {() => number}
+ */
+function resolveNowFn(customGetTime) {
+  if (typeof customGetTime === "function") {
+    return customGetTime;
+  }
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return () => performance.now();
+  }
+  return () => Date.now();
+}
+
+/**
+ * Resolves frame requester function without ternary operator.
+ * @param {((cb: (time: number) => void) => number) | undefined} customRequestFrame
+ * @returns {(cb: (time: number) => void) => number}
+ */
+function resolveRequestFrameFn(customRequestFrame) {
+  if (typeof customRequestFrame === "function") {
+    return customRequestFrame;
+  }
+  if (typeof requestAnimationFrame !== "undefined") {
+    return (callback) => requestAnimationFrame(callback);
+  }
+  return (callback) => /** @type {any} */ (setTimeout(() => callback(Date.now()), 16));
+}
+
+/**
+ * @typedef {{
+ *   from: any;
+ *   targetBounds: any;
+ *   mapSize: THREE.Vector3;
+ *   durationMs?: number;
+ *   isWorldUnits?: boolean;
+ *   onProgress?: (state: { pan: THREE.Vector3; zoom: number; progress: number; eased: number }) => void;
+ *   onComplete?: (state: { pan: THREE.Vector3; zoom: number }) => void;
+ *   requestFrame?: (callback: (time: number) => void) => number;
+ *   cancelFrame?: (id: number) => void;
+ *   getTime?: () => number;
+ * }} CameraTransitionOptions
+ */
+
+/**
+ * Interpolates camera position and zoom from current state to target bounds using cubic easing.
+ * Returns a promise and supports onProgress and onComplete callbacks.
+ * @param {CameraTransitionOptions} options
+ * @returns {Promise<{ pan: THREE.Vector3; zoom: number; progress: number; eased: number }>}
+ */
+export function interpolateCameraToBounds(options) {
+  const fromState = extractCameraState(options.from);
+  const targetFraming = readTargetFraming(options.targetBounds, options.mapSize, options);
+  let durationMs = 600;
+  if (options.durationMs !== undefined) {
+    durationMs = options.durationMs;
+  }
+  const onProgress = options.onProgress;
+  const onComplete = options.onComplete;
+  const nowFn = resolveNowFn(options.getTime);
+  const requestFrameFn = resolveRequestFrameFn(options.requestFrame);
+
+  if (durationMs <= 0) {
+    const finalState = {
+      pan: targetFraming.pan.clone(),
+      zoom: targetFraming.zoom,
+      progress: 1,
+      eased: 1,
+    };
+    if (typeof onProgress === "function") {
+      onProgress(finalState);
+    }
+    if (typeof onComplete === "function") {
+      onComplete(finalState);
+    }
+    return Promise.resolve(finalState);
+  }
+
+  return new Promise((resolve) => {
+    let startTime = /** @type {number | null} */ (null);
+
+    function step(/** @type {number} */ timestamp) {
+      if (startTime === null) {
+        startTime = timestamp;
+      }
+      const elapsed = timestamp - startTime;
+      const progress = THREE.MathUtils.clamp(elapsed / durationMs, 0, 1);
+      const state = interpolateCameraState(fromState, targetFraming, progress);
+
+      if (typeof onProgress === "function") {
+        onProgress(state);
+      }
+
+      if (progress < 1) {
+        requestFrameFn(step);
+        return;
+      }
+
+      if (typeof onComplete === "function") {
+        onComplete(state);
+      }
+      resolve(state);
+    }
+
+    requestFrameFn(step);
+  });
+}

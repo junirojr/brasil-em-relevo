@@ -1,6 +1,8 @@
 import { UF_CODE_TO_SIGLA, UF_SIGLA_TO_NAME } from "../../domain/territory-constants.js";
 
 export const TERRITORY_CHANGED = "navigation/territoryChanged";
+export const TRANSITION_STARTED = "navigation/transitionStarted";
+export const TRANSITION_COMPLETED = "navigation/transitionCompleted";
 
 /**
  * Reverse mapping from UF 2-letter uppercase abbreviation to 2-digit IBGE code.
@@ -106,9 +108,11 @@ export function getAllUfs() {
 }
 
 /**
- * @typedef {{ activeUf: string | null }} NavigationState
+ * @typedef {{ activeUf: string | null, isTransitioning: boolean }} NavigationState
  * @typedef {{ type: typeof TERRITORY_CHANGED, uf: string | null }} TerritoryChangedAction
- * @typedef {TerritoryChangedAction | { type: string }} NavigationAction
+ * @typedef {{ type: typeof TRANSITION_STARTED }} TransitionStartedAction
+ * @typedef {{ type: typeof TRANSITION_COMPLETED }} TransitionCompletedAction
+ * @typedef {TerritoryChangedAction | TransitionStartedAction | TransitionCompletedAction | { type: string }} NavigationAction
  */
 
 /**
@@ -125,7 +129,25 @@ export function createNavigationState(initialUf = null) {
       activeUf = initialUf;
     }
   }
-  return { activeUf };
+  return { activeUf, isTransitioning: false };
+}
+
+/**
+ * Action creator to start a smooth territory transition.
+ *
+ * @returns {TransitionStartedAction}
+ */
+export function startTransition() {
+  return { type: TRANSITION_STARTED };
+}
+
+/**
+ * Action creator to complete a territory transition.
+ *
+ * @returns {TransitionCompletedAction}
+ */
+export function completeTransition() {
+  return { type: TRANSITION_COMPLETED };
 }
 
 /**
@@ -156,6 +178,20 @@ export function changeTerritory(ufCodeOrNull) {
  * @returns {NavigationState}
  */
 export function reduceNavigation(state, action) {
+  if (action.type === TRANSITION_STARTED) {
+    if (state.isTransitioning) {
+      return state;
+    }
+    return { ...state, isTransitioning: true };
+  }
+
+  if (action.type === TRANSITION_COMPLETED) {
+    if (!state.isTransitioning) {
+      return state;
+    }
+    return { ...state, isTransitioning: false };
+  }
+
   if (action.type !== TERRITORY_CHANGED) {
     return state;
   }
@@ -163,21 +199,21 @@ export function reduceNavigation(state, action) {
   const targetUf = territoryAction.uf;
 
   if (targetUf === null || targetUf === undefined || targetUf === "" || targetUf === "BR") {
-    if (state.activeUf === null) {
+    if (state.activeUf === null && !state.isTransitioning) {
       return state;
     }
-    return { activeUf: null };
+    return { activeUf: null, isTransitioning: false };
   }
 
   if (!isValidUf(targetUf)) {
     return state;
   }
 
-  if (state.activeUf === targetUf) {
+  if (state.activeUf === targetUf && !state.isTransitioning) {
     return state;
   }
 
-  return { activeUf: targetUf };
+  return { activeUf: targetUf, isTransitioning: false };
 }
 
 /**
@@ -198,4 +234,17 @@ export function selectActiveUf(state) {
  */
 export function isNationalView(state) {
   return state.activeUf === null;
+}
+
+/**
+ * Selects whether territorial navigation is currently transitioning.
+ *
+ * @param {NavigationState | undefined} state
+ * @returns {boolean}
+ */
+export function isTerritoryTransitioning(state) {
+  if (!state) {
+    return false;
+  }
+  return Boolean(state.isTransitioning);
 }

@@ -2,9 +2,23 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import * as THREE from "three";
-import { normalizeBox2, readBoxFraming } from "./camera.js";
+import {
+  easeInOutCubic,
+  interpolateCameraState,
+  interpolateCameraToBounds,
+  normalizeBox2,
+  readBoxFraming,
+} from "./camera.js";
 import { createEngine } from "./engine.js";
-import { buildMunicipalities, buildUnits } from "./geometry.js";
+import {
+  buildMunicipalities,
+  buildUnits,
+  flattenMeshHeights,
+  interpolateInstanceHeightScale,
+  interpolateMeshHeightScales,
+  SAFE_MIN_SCALE_Z,
+  setInstanceHeightScale,
+} from "./geometry.js";
 
 if (typeof globalThis.requestAnimationFrame === "undefined") {
   globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 16);
@@ -219,4 +233,163 @@ test("DRL-05 readBoxFraming handles varied bounding box representations", () => 
 
   const normalized = normalizeBox2(null);
   assert.equal(normalized, null);
+});
+
+test("DRL-06 easeInOutCubic produces smooth S-curve without discontinuities", () => {
+  assert.equal(easeInOutCubic(0), 0);
+  assert.equal(easeInOutCubic(0.5), 0.5);
+  assert.equal(easeInOutCubic(1), 1);
+
+  const quarter = easeInOutCubic(0.25);
+  const threeQuarters = easeInOutCubic(0.75);
+
+  assert.ok(quarter < 0.25);
+  assert.ok(threeQuarters > 0.75);
+
+  let previous = -1;
+  for (let step = 0; step <= 20; step += 1) {
+    const val = easeInOutCubic(step / 20);
+    assert.ok(val >= previous);
+    previous = val;
+  }
+});
+
+test("DRL-07 interpolateCameraToBounds smoothly interpolates pan and zoom with progress callbacks", async () => {
+  const mapSize = new THREE.Vector3(200, 100, 10);
+  const from = { pan: new THREE.Vector3(0, 0, 0), zoom: 1 };
+  const targetBounds = new THREE.Box2(new THREE.Vector2(-20, -10), new THREE.Vector2(20, 10));
+
+  const progressStates = [];
+  let completedState = null;
+
+  let simulatedTime = 1000;
+  const simulatedGetTime = () => simulatedTime;
+  const simulatedRequestFrame = (/** @type {any} */ callback) => {
+    simulatedTime += 200;
+    setTimeout(() => callback(simulatedTime), 1);
+    return 1;
+  };
+
+  const finalState = await interpolateCameraToBounds({
+    from,
+    targetBounds,
+    mapSize,
+    durationMs: 600,
+    getTime: simulatedGetTime,
+    requestFrame: simulatedRequestFrame,
+    onProgress: (state) => {
+      progressStates.push(state);
+    },
+    onComplete: (state) => {
+      completedState = state;
+    },
+  });
+
+  assert.ok(progressStates.length > 0);
+  assert.ok(completedState);
+  assert.equal(finalState.progress, 1);
+  assert.equal(finalState.eased, 1);
+  assert.ok(finalState.zoom >= 1);
+});
+
+test("DRL-08 flattenMeshHeights and setInstanceHeightScale safely clamp scale Z to WebGL minimums", () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const plate = statesGeometry.plate;
+
+  setInstanceHeightScale(plate, 0, 0);
+
+  const matrix0 = new THREE.Matrix4();
+  plate.getMatrixAt(0, matrix0);
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  matrix0.decompose(position, quaternion, scale);
+
+  assert.ok(scale.z >= SAFE_MIN_SCALE_Z);
+  assert.ok(!Number.isNaN(scale.z));
+
+  flattenMeshHeights(plate, { scaleZ: 0.005, excludeInstanceIds: [1] });
+
+  plate.getMatrixAt(0, matrix0);
+  matrix0.decompose(position, quaternion, scale);
+  assert.ok(Math.abs(scale.z - 0.005) < 0.0001);
+
+  const matrix1 = new THREE.Matrix4();
+  plate.getMatrixAt(1, matrix1);
+  matrix1.decompose(position, quaternion, scale);
+  assert.ok(scale.z >= 0.99);
+
+  statesGeometry.plate.dispose();
+});
+
+test("DRL-09 engine.transitionCameraToBounds animates camera to target bounding box", async () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const renderer = createMockRenderer();
+  const canvas = createMockCanvas();
+
+  const engine = createEngine({
+    canvas: /** @type {any} */ (canvas),
+    renderer: /** @type {any} */ (renderer),
+    geometry: statesGeometry,
+    palette: TEST_PALETTE,
+  });
+
+  const territoryBox = new THREE.Box2(new THREE.Vector2(-10, -5), new THREE.Vector2(10, 5));
+
+  let simulatedTime = 500;
+  const simulatedGetTime = () => simulatedTime;
+  const simulatedRequestFrame = (/** @type {any} */ callback) => {
+    simulatedTime += 300;
+    setTimeout(() => callback(simulatedTime), 1);
+    return 1;
+  };
+
+  const finalCameraState = await engine.transitionCameraToBounds(territoryBox, {
+    durationMs: 600,
+    getTime: simulatedGetTime,
+    requestFrame: simulatedRequestFrame,
+  });
+
+  assert.ok(finalCameraState);
+  assert.equal(finalCameraState.progress, 1);
+  const camera = engine.readCamera();
+  assert.ok(camera.zoom >= 1);
+
+  engine.destroy();
+});
+
+test("DRL-10 engine.interpolateUnselectedHeights and interpolateInstanceHeight morph heights", async () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const renderer = createMockRenderer();
+  const canvas = createMockCanvas();
+
+  const engine = createEngine({
+    canvas: /** @type {any} */ (canvas),
+    renderer: /** @type {any} */ (renderer),
+    geometry: statesGeometry,
+    palette: TEST_PALETTE,
+  });
+
+  engine.setRaised({ pointed: null, selected: ["SP"] });
+
+  await engine.interpolateUnselectedHeights(0.001, { immediate: true });
+
+  const spInspection = engine.inspect(0);
+  const rjInspection = engine.inspect(1);
+
+  assert.ok(spInspection);
+  assert.ok(rjInspection);
+  assert.equal(spInspection.heightTarget, 1);
+  assert.ok(Math.abs(rjInspection.heightTarget - 0.001) < 0.0001);
+
+  await engine.interpolateInstanceHeight("SP", 3.0, { immediate: true });
+  const updatedSp = engine.inspect(0);
+  assert.ok(updatedSp);
+  assert.equal(updatedSp.heightTarget, 3.0);
+  assert.equal(updatedSp.heightCurrent, 3.0);
+
+  engine.destroy();
 });

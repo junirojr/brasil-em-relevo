@@ -295,3 +295,69 @@ test("NAV-19 createNavigationView throws if document reference is missing", () =
     createNavigationView({ documentRef: undefined });
   }, /Document reference is required/);
 });
+
+test("NAV-25 navigation view shows busy state and locks controls during Brazil to state transition", () => {
+  const doc = createFakeDocument();
+  const selected = [];
+  const view = createNavigationView({
+    documentRef: /** @type {any} */ (doc),
+    onSelectTerritory: (uf) => selected.push(uf),
+  });
+
+  const countryBtn = findAll(view.element, (node) => node.tagName === "button")[0];
+  const select = findAll(view.element, (node) => node.tagName === "select")[0];
+
+  view.update({ activeUf: "SP", isTransitioning: true });
+
+  assert.equal(view.element.classList.contains("is-transitioning"), true);
+  assert.equal(view.element.getAttribute("aria-busy"), "true");
+  assert.equal(countryBtn.disabled, true);
+  assert.equal(select.disabled, true);
+
+  countryBtn.fire("click");
+  assert.equal(selected.length, 0);
+
+  select.value = "33";
+  select.fire("change");
+  assert.equal(selected.length, 0);
+});
+
+test("NAV-26 navigation view restores controls and breadcrumb when transitioning back to Brazil", () => {
+  const doc = createFakeDocument();
+  const selected = [];
+  const view = createNavigationView({
+    documentRef: /** @type {any} */ (doc),
+    onSelectTerritory: (uf) => selected.push(uf),
+  });
+
+  const countryBtn = findAll(view.element, (node) => node.tagName === "button")[0];
+  const select = findAll(view.element, (node) => node.tagName === "select")[0];
+
+  view.update({ activeUf: "SP", isTransitioning: true });
+  assert.equal(view.element.classList.contains("is-transitioning"), true);
+  assert.equal(countryBtn.disabled, true);
+
+  view.update({ activeUf: null, isTransitioning: false });
+
+  assert.equal(view.element.classList.contains("is-transitioning"), false);
+  assert.equal(view.element.getAttribute("aria-busy"), null);
+  assert.equal(countryBtn.disabled, false);
+  assert.equal(select.disabled, false);
+});
+
+test("NAV-27 navigation view renders immediately without transitioning lock when motion is reduced", () => {
+  const doc = createFakeDocument();
+  const view = createNavigationView({
+    documentRef: /** @type {any} */ (doc),
+  });
+
+  view.update({ activeUf: "35", isTransitioning: false });
+
+  assert.equal(view.element.classList.contains("is-transitioning"), false);
+  assert.equal(view.element.getAttribute("aria-busy"), null);
+
+  const countryBtn = findAll(view.element, (node) => node.tagName === "button")[0];
+  const select = findAll(view.element, (node) => node.tagName === "select")[0];
+  assert.equal(countryBtn.disabled, false);
+  assert.equal(select.disabled, false);
+});

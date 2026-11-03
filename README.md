@@ -1,4 +1,4 @@
-# Brasil e São Paulo em relevo
+# Brasil em relevo
 
 Visualização tridimensional e interativa do território brasileiro e de seus 5.571 municípios distribuídos nas 27 Unidades da Federação, com relevo proporcional a indicadores socioeconômicos, demográficos e apurações eleitorais, renderizada com Three.js diretamente no navegador web.
 

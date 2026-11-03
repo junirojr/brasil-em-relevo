@@ -118,7 +118,12 @@ export function createNavigationView(options = {}) {
    * @param {MouseEvent} event
    */
   function handleCountryClick(event) {
-    event.preventDefault();
+    if (event && typeof event.preventDefault === "function") {
+      event.preventDefault();
+    }
+    if (countryButton.disabled) {
+      return;
+    }
     if (typeof callback === "function") {
       callback(null);
     }
@@ -128,6 +133,9 @@ export function createNavigationView(options = {}) {
    * @param {Event} _event
    */
   function handleSelectChange(_event) {
+    if (selectElement.disabled) {
+      return;
+    }
     const rawValue = selectElement.value;
     if (typeof callback !== "function") {
       return;
@@ -146,6 +154,19 @@ export function createNavigationView(options = {}) {
    * @param {NavigationState} state
    */
   function update(state) {
+    if (state.isTransitioning) {
+      nav.classList.add("is-transitioning");
+      nav.setAttribute("aria-busy", "true");
+      countryButton.disabled = true;
+      selectElement.disabled = true;
+    }
+    if (!state.isTransitioning) {
+      nav.classList.remove("is-transitioning");
+      nav.removeAttribute("aria-busy");
+      countryButton.disabled = false;
+      selectElement.disabled = false;
+    }
+
     const national = isNationalView(state);
 
     if (national) {

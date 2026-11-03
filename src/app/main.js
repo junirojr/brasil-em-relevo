@@ -34,7 +34,13 @@ import { mountModeToggle } from "../features/layout/mode-toggle-view.js";
 import { mountThemeToggle } from "../features/layout/theme-toggle-view.js";
 import { changeLevel } from "../features/level/level-slice.js";
 import { mountLevelView } from "../features/level/level-view.js";
-import { changeTerritory } from "../features/navigation/navigation-slice.js";
+import {
+  changeTerritory,
+  completeTransition,
+  resolveUfCode,
+  resolveUfSigla,
+  startTransition,
+} from "../features/navigation/navigation-slice.js";
 import { mountNavigationView } from "../features/navigation/navigation-view.js";
 import { mountRegionLabelsView } from "../features/region-labels/region-labels-view.js";
 import { mountHowToReadView } from "../features/scale/how-to-read-view.js";
@@ -185,6 +191,14 @@ export async function bootApplication(documentRef = document, windowRef = window
     headerStatsView = mountHeaderStats(documentRef, headerStatsContainer);
   }
 
+  let isTransitioning = false;
+  let currentGeo = geo;
+  /** @type {any} */
+  let nationalBounds = null;
+  if (!initialUf) {
+    nationalBounds = geo.mapBounds;
+  }
+
   const navigationContainer = documentRef.getElementById("navigation-container");
   /** @type {import("../features/navigation/navigation-view.js").NavigationView | null} */
   let navigationView = null;
@@ -194,6 +208,9 @@ export async function bootApplication(documentRef = document, windowRef = window
     navigationView = mountNavigationView(navigationContainer, {
       documentRef,
       onSelectTerritory: (targetUf) => {
+        if (isTransitioning) {
+          return;
+        }
         transitionTerritory(targetUf);
       },
     });
@@ -209,22 +226,243 @@ export async function bootApplication(documentRef = document, windowRef = window
    * @param {string | null} [targetUf]
    */
   async function transitionTerritory(targetUf) {
-    const cleanUf = targetUf || null;
-    if (store.getState().navigation.activeUf === cleanUf) {
+    if (isTransitioning) {
       return;
     }
-    store.dispatch(changeTerritory(cleanUf));
-    syncUrlState(windowRef, {
-      indicatorId: store.getState().indicator.id,
-      levelId: store.getState().level.id,
-      tab: store.getState().tab,
-      uf: cleanUf,
-    });
+    const cleanUf = targetUf || null;
+    const currentActiveUf = store.getState().navigation.activeUf;
+    if (currentActiveUf === cleanUf) {
+      return;
+    }
+
+    let isMotionReduced = false;
+    if (windowRef?.matchMedia) {
+      const media = windowRef.matchMedia("(prefers-reduced-motion: reduce)");
+      if (media.matches) {
+        isMotionReduced = true;
+      }
+    }
+    const currentSettings = store.getState().settings;
+    if (currentSettings && currentSettings.isMotionReduced) {
+      isMotionReduced = true;
+    }
+
+    if (isMotionReduced) {
+      isTransitioning = true;
+      store.dispatch(startTransition());
+      stageView.setStatus("Carregando território...");
+      try {
+        const nextData = await loadTerritoryData(cleanUf, fetch, (file) => {
+          stageView.setStatus(`Carregando ${file}...`);
+        });
+        territory = createTerritory({
+          municipalities: nextData.municipalities,
+          regions: nextData.regions,
+        });
+        if (searchView && typeof searchView.updateTerritory === "function") {
+          searchView.updateTerritory(territory);
+        }
+        const nextGeo = buildMunicipalities(nextData.mesh);
+        currentGeo = nextGeo;
+        if (cleanUf === null && !nationalBounds) {
+          nationalBounds = nextGeo.mapBounds;
+        }
+        if (engine) {
+          engine.replaceMesh(nextGeo, { immediate: true });
+          engine.frameBoundsNow(nextGeo.mapBounds);
+        }
+        store.dispatch(changeData(nextData));
+        store.dispatch(changeTerritory(cleanUf));
+        syncUrlState(windowRef, {
+          indicatorId: store.getState().indicator.id,
+          levelId: store.getState().level.id,
+          tab: store.getState().tab,
+          uf: cleanUf,
+        });
+        stageView.setStatus("");
+      } catch (_error) {
+        stageView.setAlert("Falha ao carregar território.");
+      } finally {
+        isTransitioning = false;
+        store.dispatch(completeTransition());
+      }
+      return;
+    }
+
+    isTransitioning = true;
+    store.dispatch(startTransition());
+
+    if (currentActiveUf === null && cleanUf !== null) {
+      stageView.setStatus("Carregando território...");
+      try {
+        const targetCode = resolveUfCode(cleanUf);
+        const targetSigla = resolveUfSigla(cleanUf);
+        let targetUnit = null;
+        for (let i = 0; i < currentGeo.municipalities.length; i += 1) {
+          const m = currentGeo.municipalities[i];
+          if (m.code === targetCode || m.code === targetSigla || m.code === cleanUf) {
+            targetUnit = m;
+            break;
+          }
+        }
+
+        let targetBounds = currentGeo.mapBounds;
+        if (targetUnit && targetUnit.bounds) {
+          targetBounds = targetUnit.bounds;
+        }
+
+        let cameraFlightPromise = Promise.resolve();
+        let flattenOthersPromise = Promise.resolve();
+        if (engine) {
+          cameraFlightPromise = engine.transitionCameraToBounds(targetBounds, {
+            durationMs: 600,
+          });
+          /** @type {(string | number)[]} */
+          let selectedIndexes = [];
+          if (targetUnit) {
+            selectedIndexes = [targetUnit.code];
+          }
+          flattenOthersPromise = engine.interpolateUnselectedHeights(0.001, {
+            durationMs: 600,
+            selectedIndexes,
+          });
+        }
+
+        const dataPromise = loadTerritoryData(cleanUf, fetch, (file) => {
+          stageView.setStatus(`Carregando ${file}...`);
+        });
+
+        const [_, __, nextData] = await Promise.all([
+          cameraFlightPromise,
+          flattenOthersPromise,
+          dataPromise,
+        ]);
+
+        const nextGeo = buildMunicipalities(nextData.mesh);
+        currentGeo = nextGeo;
+
+        if (engine) {
+          engine.replaceMesh(nextGeo, { immediate: true });
+          engine.flattenHeights({ immediate: true, scaleZ: 0.001 });
+          engine.frameBoundsNow(nextGeo.mapBounds);
+        }
+
+        territory = createTerritory({
+          municipalities: nextData.municipalities,
+          regions: nextData.regions,
+        });
+        if (searchView && typeof searchView.updateTerritory === "function") {
+          searchView.updateTerritory(territory);
+        }
+
+        store.dispatch(changeData(nextData));
+        store.dispatch(changeTerritory(cleanUf));
+
+        if (engine) {
+          /** @type {number | Float32Array} */
+          let targetHeights = 1.0;
+          const currentTab = store.getState().tab;
+          if (currentTab !== "first-round" && currentTab !== "second-round") {
+            targetHeights = selectors.selectHeightTargets(store.getState());
+          }
+          await engine.interpolateHeights(targetHeights, { durationMs: 400 });
+        }
+
+        syncUrlState(windowRef, {
+          indicatorId: store.getState().indicator.id,
+          levelId: store.getState().level.id,
+          tab: store.getState().tab,
+          uf: cleanUf,
+        });
+        stageView.setStatus("");
+      } catch (_error) {
+        stageView.setAlert("Falha ao carregar território.");
+      } finally {
+        isTransitioning = false;
+        store.dispatch(completeTransition());
+      }
+      return;
+    }
+
+    if (currentActiveUf !== null && cleanUf === null) {
+      stageView.setStatus("Retornando ao Brasil...");
+      try {
+        let flattenPromise = Promise.resolve();
+        if (engine) {
+          flattenPromise = engine.flattenHeights({ durationMs: 400, scaleZ: 0.001 });
+        }
+        const dataPromise = loadTerritoryData(null, fetch, (file) => {
+          stageView.setStatus(`Carregando ${file}...`);
+        });
+
+        const [_, nextData] = await Promise.all([flattenPromise, dataPromise]);
+        const nextGeo = buildMunicipalities(nextData.mesh);
+        currentGeo = nextGeo;
+        nationalBounds = nextGeo.mapBounds;
+
+        if (engine) {
+          engine.replaceMesh(nextGeo, { immediate: true });
+          engine.flattenHeights({ immediate: true, scaleZ: 0.001 });
+          await engine.transitionCameraToBounds(nextGeo.mapBounds, { durationMs: 600 });
+        }
+
+        territory = createTerritory({
+          municipalities: nextData.municipalities,
+          regions: nextData.regions,
+        });
+        if (searchView && typeof searchView.updateTerritory === "function") {
+          searchView.updateTerritory(territory);
+        }
+
+        store.dispatch(changeData(nextData));
+        store.dispatch(changeTerritory(null));
+
+        if (engine) {
+          /** @type {number | Float32Array} */
+          let targetHeights = 1.0;
+          const currentTab = store.getState().tab;
+          if (currentTab !== "first-round" && currentTab !== "second-round") {
+            targetHeights = selectors.selectHeightTargets(store.getState());
+          }
+          await engine.interpolateHeights(targetHeights, { durationMs: 400 });
+        }
+
+        syncUrlState(windowRef, {
+          indicatorId: store.getState().indicator.id,
+          levelId: store.getState().level.id,
+          tab: store.getState().tab,
+          uf: null,
+        });
+        stageView.setStatus("");
+      } catch (_error) {
+        stageView.setAlert("Falha ao carregar território.");
+      } finally {
+        isTransitioning = false;
+        store.dispatch(completeTransition());
+      }
+      return;
+    }
+
     stageView.setStatus("Carregando território...");
     try {
-      const nextData = await loadTerritoryData(cleanUf, fetch, (file) => {
+      let flattenPromise = Promise.resolve();
+      if (engine) {
+        flattenPromise = engine.flattenHeights({ durationMs: 400, scaleZ: 0.001 });
+      }
+      const dataPromise = loadTerritoryData(cleanUf, fetch, (file) => {
         stageView.setStatus(`Carregando ${file}...`);
       });
+
+      const [_, nextData] = await Promise.all([flattenPromise, dataPromise]);
+      const nextGeo = buildMunicipalities(nextData.mesh);
+      currentGeo = nextGeo;
+
+      if (engine) {
+        engine.replaceMesh(nextGeo, { immediate: true });
+        engine.flattenHeights({ immediate: true, scaleZ: 0.001 });
+        engine.frameBoundsNow(nextGeo.mapBounds);
+      }
+
       territory = createTerritory({
         municipalities: nextData.municipalities,
         regions: nextData.regions,
@@ -232,13 +470,32 @@ export async function bootApplication(documentRef = document, windowRef = window
       if (searchView && typeof searchView.updateTerritory === "function") {
         searchView.updateTerritory(territory);
       }
-      const nextGeo = buildMunicipalities(nextData.mesh);
-      engine.replaceMesh(nextGeo);
-      engine.frameBoundsNow(nextGeo.mapBounds);
+
       store.dispatch(changeData(nextData));
+      store.dispatch(changeTerritory(cleanUf));
+
+      if (engine) {
+        /** @type {number | Float32Array} */
+        let targetHeights = 1.0;
+        const currentTab = store.getState().tab;
+        if (currentTab !== "first-round" && currentTab !== "second-round") {
+          targetHeights = selectors.selectHeightTargets(store.getState());
+        }
+        await engine.interpolateHeights(targetHeights, { durationMs: 400 });
+      }
+
+      syncUrlState(windowRef, {
+        indicatorId: store.getState().indicator.id,
+        levelId: store.getState().level.id,
+        tab: store.getState().tab,
+        uf: cleanUf,
+      });
       stageView.setStatus("");
     } catch (_error) {
       stageView.setAlert("Falha ao carregar território.");
+    } finally {
+      isTransitioning = false;
+      store.dispatch(completeTransition());
     }
   }
 
@@ -385,6 +642,9 @@ export async function bootApplication(documentRef = document, windowRef = window
       if (event.key !== "Escape") {
         return;
       }
+      if (isTransitioning) {
+        return;
+      }
       const state = store.getState();
       if (state.navigation.activeUf === null) {
         return;
@@ -417,12 +677,21 @@ export async function bootApplication(documentRef = document, windowRef = window
       },
       palette,
       onPoint: (code) => {
+        if (isTransitioning) {
+          return;
+        }
         store.dispatch(changePointedUnit(code));
       },
       onInspect: (code) => {
+        if (isTransitioning) {
+          return;
+        }
         store.dispatch(changeInspectedUnit(code));
       },
       onPick: (code) => {
+        if (isTransitioning) {
+          return;
+        }
         if (!code) {
           return;
         }
@@ -481,6 +750,9 @@ export async function bootApplication(documentRef = document, windowRef = window
       readSelectedCodes: () => store.getState().selection.selectedCodes,
       readActiveUf: () => store.getState().navigation?.activeUf ?? "SP",
       onSelectMunicipality: (selection) => {
+        if (isTransitioning) {
+          return;
+        }
         const targetUf = selection?.targetUf || selection?.uf || selection?.destinationUf;
         if (targetUf && targetUf !== store.getState().navigation?.activeUf) {
           transitionTerritory(targetUf);

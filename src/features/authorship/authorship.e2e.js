@@ -10,10 +10,10 @@ test.describe("AUT authorship and metadata (AUT-01 to AUT-04)", () => {
     const { context, page } = await openPage(browser, { viewport: VIEWPORT_1366_768 });
     try {
       const title = await page.title();
-      expect(title).toBe("São Paulo em relevo");
+      expect(title).toBe("Brasil em relevo");
 
       const h1 = page.locator("h1.app-title");
-      await expect(h1).toHaveText("São Paulo em relevo");
+      await expect(h1).toHaveText("Brasil em relevo");
 
       const subtitle = page.locator(".app-subtitle");
       await expect(subtitle).toBeVisible();

@@ -14,6 +14,18 @@
   border-radius: var(--radius-lg, 12px);
   font-family: var(--font-body, system-ui, sans-serif);
   min-width: 0;
+  transition: opacity 0.2s ease;
+}
+
+.nav-territory.is-transitioning {
+  opacity: 0.65;
+  pointer-events: none;
+  cursor: wait;
+}
+
+.nav-territory.is-transitioning .nav-breadcrumb-btn,
+.nav-territory.is-transitioning .nav-uf-select {
+  cursor: wait;
 }
 
 .nav-breadcrumbs {

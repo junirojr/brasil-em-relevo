@@ -2,16 +2,21 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   changeTerritory,
+  completeTransition,
   createNavigationState,
   getAllUfs,
   isNationalView,
+  isTerritoryTransitioning,
   isValidUf,
   reduceNavigation,
   resolveUfCode,
   resolveUfName,
   resolveUfSigla,
   selectActiveUf,
+  startTransition,
   TERRITORY_CHANGED,
+  TRANSITION_COMPLETED,
+  TRANSITION_STARTED,
 } from "./navigation-slice.js";
 
 test("NAV-01 initial navigation state defaults to national view", () => {
@@ -135,4 +140,37 @@ test("NAV-09 helpers resolve UF code, abbreviation and official name accurately"
   assert.equal(resolveUfName("SP"), "São Paulo");
   assert.equal(resolveUfName("33"), "Rio de Janeiro");
   assert.equal(resolveUfName("INVALID"), null);
+});
+
+test("NAV-25 transition lifecycle starts transition and sets transitioning flag", () => {
+  const initial = createNavigationState();
+  assert.equal(isTerritoryTransitioning(initial), false);
+
+  const transitioning = reduceNavigation(initial, startTransition());
+  assert.equal(isTerritoryTransitioning(transitioning), true);
+  assert.equal(transitioning.isTransitioning, true);
+
+  const redundant = reduceNavigation(transitioning, startTransition());
+  assert.equal(redundant, transitioning);
+});
+
+test("NAV-26 transition lifecycle completes transition and clears transitioning flag", () => {
+  const transitioning = { activeUf: "35", isTransitioning: true };
+  const completed = reduceNavigation(transitioning, completeTransition());
+  assert.equal(isTerritoryTransitioning(completed), false);
+  assert.equal(completed.isTransitioning, false);
+
+  const redundantCompleted = reduceNavigation(completed, completeTransition());
+  assert.equal(redundantCompleted, completed);
+});
+
+test("NAV-27 territory change updates active UF directly without persistent transitioning flag", () => {
+  const initial = createNavigationState(null);
+  const directChange = reduceNavigation(initial, changeTerritory("MG"));
+  assert.equal(directChange.activeUf, "MG");
+  assert.equal(isTerritoryTransitioning(directChange), false);
+
+  const returnToBr = reduceNavigation(directChange, changeTerritory(null));
+  assert.equal(returnToBr.activeUf, null);
+  assert.equal(isTerritoryTransitioning(returnToBr), false);
 });

@@ -416,3 +416,147 @@ function appendPointsSkippingDuplicate(target, source) {
     target.push(source[i]);
   }
 }
+
+export const SAFE_MIN_SCALE_Z = 0.001;
+
+const scratchInstanceMatrix = new THREE.Matrix4();
+const scratchPosition = new THREE.Vector3();
+const scratchQuaternion = new THREE.Quaternion();
+const scratchScale = new THREE.Vector3();
+
+/**
+ * Sets scale Z of a BatchedMesh instance safely without breaking WebGL limits.
+ * @param {THREE.BatchedMesh} plate
+ * @param {number} instanceId
+ * @param {number} scaleZ
+ * @param {{ minScaleZ?: number }} [options]
+ */
+export function setInstanceHeightScale(plate, instanceId, scaleZ, options = {}) {
+  if (!plate || instanceId < 0 || instanceId >= plate.instanceCount) {
+    return;
+  }
+  let minScaleZ = SAFE_MIN_SCALE_Z;
+  if (options.minScaleZ !== undefined) {
+    minScaleZ = options.minScaleZ;
+  }
+  const safeScaleZ = Math.max(minScaleZ, scaleZ);
+
+  plate.getMatrixAt(instanceId, scratchInstanceMatrix);
+  scratchInstanceMatrix.decompose(scratchPosition, scratchQuaternion, scratchScale);
+  scratchScale.z = safeScaleZ;
+  scratchInstanceMatrix.compose(scratchPosition, scratchQuaternion, scratchScale);
+  plate.setMatrixAt(instanceId, scratchInstanceMatrix);
+}
+
+/**
+ * Flattens vertical scale (scale.z) for specified instances or the entire BatchedMesh.
+ * @param {THREE.BatchedMesh} plate
+ * @param {{
+ *   scaleZ?: number;
+ *   instanceIds?: number[] | Set<number>;
+ *   excludeInstanceIds?: number[] | Set<number>;
+ *   minScaleZ?: number;
+ * }} [options]
+ */
+export function flattenMeshHeights(plate, options = {}) {
+  if (!plate || plate.instanceCount <= 0) {
+    return;
+  }
+  let targetScaleZ = SAFE_MIN_SCALE_Z;
+  if (options.scaleZ !== undefined) {
+    targetScaleZ = options.scaleZ;
+  }
+  let targetIds = null;
+  if (options.instanceIds) {
+    targetIds = new Set(options.instanceIds);
+  }
+  let excludeIds = null;
+  if (options.excludeInstanceIds) {
+    excludeIds = new Set(options.excludeInstanceIds);
+  }
+
+  for (let id = 0; id < plate.instanceCount; id += 1) {
+    if (targetIds && !targetIds.has(id)) {
+      continue;
+    }
+    if (excludeIds && excludeIds.has(id)) {
+      continue;
+    }
+    setInstanceHeightScale(plate, id, targetScaleZ, options);
+  }
+}
+
+/**
+ * Interpolates height scale (scale.z) of a single instance.
+ * @param {THREE.BatchedMesh} plate
+ * @param {number} instanceId
+ * @param {number} startScaleZ
+ * @param {number} targetScaleZ
+ * @param {number} t Progress from 0 to 1
+ * @param {{ minScaleZ?: number; easing?: (t: number) => number }} [options]
+ */
+export function interpolateInstanceHeightScale(
+  plate,
+  instanceId,
+  startScaleZ,
+  targetScaleZ,
+  t,
+  options = {},
+) {
+  const clampedT = THREE.MathUtils.clamp(t, 0, 1);
+  let progress = clampedT;
+  if (typeof options.easing === "function") {
+    progress = options.easing(clampedT);
+  }
+  const currentScaleZ = THREE.MathUtils.lerp(startScaleZ, targetScaleZ, progress);
+  setInstanceHeightScale(plate, instanceId, currentScaleZ, options);
+}
+
+/**
+ * Interpolates height scale (scale.z) across mesh instances.
+ * @param {THREE.BatchedMesh} plate
+ * @param {ArrayLike<number> | number} startScales
+ * @param {ArrayLike<number> | number} targetScales
+ * @param {number} t Progress from 0 to 1
+ * @param {{
+ *   excludeInstanceIds?: number[] | Set<number>;
+ *   minScaleZ?: number;
+ *   easing?: (t: number) => number;
+ * }} [options]
+ */
+export function interpolateMeshHeightScales(plate, startScales, targetScales, t, options = {}) {
+  if (!plate || plate.instanceCount <= 0) {
+    return;
+  }
+  const clampedT = THREE.MathUtils.clamp(t, 0, 1);
+  let progress = clampedT;
+  if (typeof options.easing === "function") {
+    progress = options.easing(clampedT);
+  }
+  let excludeIds = null;
+  if (options.excludeInstanceIds) {
+    excludeIds = new Set(options.excludeInstanceIds);
+  }
+
+  for (let id = 0; id < plate.instanceCount; id += 1) {
+    if (excludeIds && excludeIds.has(id)) {
+      continue;
+    }
+    let startVal = 1;
+    if (typeof startScales === "number") {
+      startVal = startScales;
+    }
+    if (typeof startScales !== "number" && startScales && startScales[id] !== undefined) {
+      startVal = startScales[id];
+    }
+    let targetVal = SAFE_MIN_SCALE_Z;
+    if (typeof targetScales === "number") {
+      targetVal = targetScales;
+    }
+    if (typeof targetScales !== "number" && targetScales && targetScales[id] !== undefined) {
+      targetVal = targetScales[id];
+    }
+    const currentScaleZ = THREE.MathUtils.lerp(startVal, targetVal, progress);
+    setInstanceHeightScale(plate, id, currentScaleZ, options);
+  }
+}

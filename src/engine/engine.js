@@ -6,6 +6,7 @@ import {
   clampZoomTarget,
   computeFitDistance,
   createWheelAccumulator,
+  interpolateCameraToBounds,
   normalizeBox2,
   positionCamera,
   readBoxFraming,
@@ -17,6 +18,7 @@ import { WORLD_UNITS_PER_SVG_UNIT } from "./constants.js";
 import {
   buildIndexByCode,
   createMapMotion,
+  placeMunicipality,
   readElapsed,
   readMedianSample,
   readRaisedIndexes,
@@ -35,6 +37,9 @@ import {
   buildOwnedLines,
   disposeOwnedLines,
   disposePlate,
+  flattenMeshHeights,
+  SAFE_MIN_SCALE_Z,
+  setInstanceHeightScale,
 } from "./geometry.js";
 import {
   applyLimitStyle,
@@ -171,8 +176,13 @@ const OUTLINE_LIFT_SHARE = 1;
  *   readSelectionOutline: () => any;
  *   frame: (indexes: number[]) => void;
  *   frameNow: (indexes: number[]) => void;
- *   frameBounds: (bounds: any, options?: { immediate?: boolean; isWorldUnits?: boolean }) => void;
+ *   frameBounds: (bounds: any, options?: { immediate?: boolean; isWorldUnits?: boolean; durationMs?: number }) => any;
  *   frameBoundsNow: (bounds: any, options?: { isWorldUnits?: boolean }) => void;
+ *   transitionCameraToBounds: (bounds: any, options?: any) => Promise<any>;
+ *   flattenHeights: (options?: any) => Promise<void>;
+ *   interpolateHeights: (targets: any, options?: any) => Promise<void>;
+ *   interpolateInstanceHeight: (indexOrCode: number | string, targetScaleZ: number, options?: any) => Promise<void>;
+ *   interpolateUnselectedHeights: (targetScaleZ?: number, options?: any) => Promise<void>;
  *   replaceMesh: (geometry: any, options?: { collectionName?: string; bounds?: any; frame?: boolean; immediate?: boolean; resetView?: boolean; isWorldUnits?: boolean }) => void;
  *   setGeometry: (geometry: any, options?: { collectionName?: string; bounds?: any; frame?: boolean; immediate?: boolean; resetView?: boolean; isWorldUnits?: boolean }) => void;
  *   zoomStep: (direction: number, screenPoint?: { x: number; y: number }) => void;
@@ -291,6 +301,13 @@ export function createEngine(options) {
     frameNow: (indexes) => frameIndexes(ctx, indexes),
     frameBounds: (bounds, options) => frameBounds(ctx, bounds, options),
     frameBoundsNow: (bounds, options) => frameBounds(ctx, bounds, { ...options, immediate: true }),
+    transitionCameraToBounds: (bounds, options) => transitionCameraToBounds(ctx, bounds, options),
+    flattenHeights: (options) => flattenHeights(ctx, options),
+    interpolateHeights: (targets, options) => interpolateHeights(ctx, targets, options),
+    interpolateInstanceHeight: (indexOrCode, targetScaleZ, options) =>
+      interpolateInstanceHeight(ctx, indexOrCode, targetScaleZ, options),
+    interpolateUnselectedHeights: (targetScaleZ, options) =>
+      interpolateUnselectedHeights(ctx, targetScaleZ, options),
     replaceMesh: (geometry, options) => replaceMesh(ctx, geometry, options),
     setGeometry: (geometry, options) => replaceMesh(ctx, geometry, options),
     setTiltTarget: (/** @type {number} */ x, /** @type {number} */ y) => {
@@ -1080,12 +1097,15 @@ function frameIndexes(ctx, indexes) {
  * Smoothly frames the camera on the given bounding box of a territory or selection.
  * @param {EngineContext} ctx
  * @param {THREE.Box2 | THREE.Box3 | any} bounds
- * @param {{ immediate?: boolean; isWorldUnits?: boolean }} [options]
+ * @param {{ immediate?: boolean; isWorldUnits?: boolean; durationMs?: number } | any} [options]
  */
 function frameBounds(ctx, bounds, options = {}) {
   if (!bounds) {
     resetView(ctx);
     return;
+  }
+  if (options.durationMs !== undefined && options.durationMs > 0) {
+    return transitionCameraToBounds(ctx, bounds, options);
   }
   const framing = readBoxFraming(bounds, ctx.view.mapSize, options);
   ctx.panTarget.copy(framing.pan);
@@ -1096,6 +1116,427 @@ function frameBounds(ctx, bounds, options = {}) {
     positionCamera(ctx.view.camera, ctx.orbit);
   }
   requestFrame(ctx);
+}
+
+/**
+ * Resolves the Set of selected municipality indexes from context and options without ternary operator.
+ * @param {EngineContext} ctx
+ * @param {any} [options]
+ * @returns {Set<number>}
+ */
+function resolveSelectedSet(ctx, options = {}) {
+  const selectedSet = new Set(ctx.raise.selected);
+  if (options.selectedIndexes) {
+    for (const item of options.selectedIndexes) {
+      if (typeof item === "number") {
+        selectedSet.add(item);
+      }
+      if (typeof item === "string") {
+        const index = ctx.indexByCode.get(item);
+        if (index !== undefined) {
+          selectedSet.add(index);
+        }
+      }
+    }
+  }
+  return selectedSet;
+}
+
+/**
+ * Resolves animation requester function without ternary operator.
+ * @param {((cb: (time: number) => void) => number) | undefined} customRequestFrame
+ * @returns {(cb: (time: number) => void) => number}
+ */
+function resolveEngineRequestFrameFn(customRequestFrame) {
+  if (typeof customRequestFrame === "function") {
+    return customRequestFrame;
+  }
+  if (typeof requestAnimationFrame !== "undefined") {
+    return (callback) => requestAnimationFrame(callback);
+  }
+  return (callback) => /** @type {any} */ (setTimeout(() => callback(Date.now()), 16));
+}
+
+/**
+ * Smoothly transitions the camera to target bounds using cubic easing.
+ * @param {EngineContext} ctx
+ * @param {any} bounds
+ * @param {any} [options]
+ * @returns {Promise<{ pan: THREE.Vector3; zoom: number; progress: number; eased: number }>}
+ */
+function transitionCameraToBounds(ctx, bounds, options = {}) {
+  const from = {
+    pan: ctx.orbit.pan.clone(),
+    zoom: ctx.zoomState.current,
+  };
+  let durationMs = 600;
+  if (options.durationMs !== undefined) {
+    durationMs = options.durationMs;
+  }
+  const requestFrameFn = resolveEngineRequestFrameFn(options.requestFrame);
+
+  return interpolateCameraToBounds({
+    from,
+    targetBounds: bounds,
+    mapSize: ctx.view.mapSize,
+    durationMs,
+    isWorldUnits: options.isWorldUnits,
+    requestFrame: requestFrameFn,
+    getTime: options.getTime,
+    onProgress: (state) => {
+      ctx.orbit.pan.copy(state.pan);
+      ctx.panTarget.copy(state.pan);
+      ctx.zoomState.current = state.zoom;
+      ctx.zoomState.target = state.zoom;
+      ctx.view.camera.zoom = state.zoom;
+      ctx.view.camera.updateProjectionMatrix();
+      positionCamera(ctx.view.camera, ctx.orbit);
+      if (typeof options.onProgress === "function") {
+        options.onProgress(state);
+      }
+      requestFrame(ctx);
+    },
+    onComplete: (state) => {
+      ctx.orbit.pan.copy(state.pan);
+      ctx.panTarget.copy(state.pan);
+      ctx.zoomState.current = state.zoom;
+      ctx.zoomState.target = state.zoom;
+      ctx.view.camera.zoom = state.zoom;
+      ctx.view.camera.updateProjectionMatrix();
+      positionCamera(ctx.view.camera, ctx.orbit);
+      if (typeof options.onComplete === "function") {
+        options.onComplete(state);
+      }
+      requestFrame(ctx);
+    },
+  });
+}
+
+/**
+ * Flattens vertical scale (scale.z) for all or unselected instances.
+ * @param {EngineContext} ctx
+ * @param {any} [options]
+ * @returns {Promise<void>}
+ */
+function flattenHeights(ctx, options = {}) {
+  let targetScaleZ = SAFE_MIN_SCALE_Z;
+  if (options.scaleZ !== undefined) {
+    targetScaleZ = options.scaleZ;
+  }
+  const safeTarget = Math.max(SAFE_MIN_SCALE_Z, targetScaleZ);
+  if (options.excludeSelected) {
+    return interpolateUnselectedHeights(ctx, safeTarget, options);
+  }
+  let durationMs = 0;
+  if (options.durationMs !== undefined) {
+    durationMs = options.durationMs;
+  }
+  if (durationMs > 0) {
+    return interpolateHeights(ctx, safeTarget, options);
+  }
+
+  for (let i = 0; i < ctx.municipalities.length; i += 1) {
+    ctx.motion.heightTargets[i] = safeTarget;
+    if (options.immediate) {
+      ctx.motion.heightCurrent[i] = safeTarget;
+      placeMunicipality(ctx.motion, i);
+    }
+  }
+
+  if (!options.immediate) {
+    ctx.motion.isHeightMoving = true;
+  }
+  updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+  requestFrame(ctx);
+  if (typeof options.onComplete === "function") {
+    options.onComplete();
+  }
+  return Promise.resolve();
+}
+
+/**
+ * Interpolates heights toward target scales across instances.
+ * @param {EngineContext} ctx
+ * @param {any} targets
+ * @param {any} [options]
+ * @returns {Promise<void>}
+ */
+function interpolateHeights(ctx, targets, options = {}) {
+  let durationMs = 0;
+  if (options.durationMs !== undefined) {
+    durationMs = options.durationMs;
+  }
+  const municipalityCount = ctx.municipalities.length;
+
+  if (durationMs <= 0) {
+    if (typeof targets === "number") {
+      const safe = Math.max(SAFE_MIN_SCALE_Z, targets);
+      for (let i = 0; i < municipalityCount; i += 1) {
+        ctx.motion.heightTargets[i] = safe;
+        if (options.immediate) {
+          ctx.motion.heightCurrent[i] = safe;
+          placeMunicipality(ctx.motion, i);
+        }
+      }
+    }
+    if (typeof targets !== "number" && targets && targets.length) {
+      for (let i = 0; i < municipalityCount && i < targets.length; i += 1) {
+        const safe = Math.max(SAFE_MIN_SCALE_Z, targets[i]);
+        ctx.motion.heightTargets[i] = safe;
+        if (options.immediate) {
+          ctx.motion.heightCurrent[i] = safe;
+          placeMunicipality(ctx.motion, i);
+        }
+      }
+    }
+    if (!options.immediate) {
+      ctx.motion.isHeightMoving = true;
+    }
+    updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+    requestFrame(ctx);
+    if (typeof options.onComplete === "function") {
+      options.onComplete();
+    }
+    return Promise.resolve();
+  }
+
+  const startScales = new Float32Array(ctx.motion.heightCurrent);
+  const requestFrameFn = resolveEngineRequestFrameFn(options.requestFrame);
+
+  return new Promise((resolve) => {
+    let startTime = /** @type {number | null} */ (null);
+
+    function step(/** @type {number} */ timestamp) {
+      if (startTime === null) {
+        startTime = timestamp;
+      }
+      const elapsed = timestamp - startTime;
+      const progress = THREE.MathUtils.clamp(elapsed / durationMs, 0, 1);
+      let eased = progress;
+      if (progress < 0.5) {
+        eased = 4 * progress * progress * progress;
+      }
+      if (progress >= 0.5) {
+        eased = 1 - Math.pow(-2 * progress + 2, 3) / 2;
+      }
+
+      for (let i = 0; i < municipalityCount; i += 1) {
+        let targetVal = SAFE_MIN_SCALE_Z;
+        if (typeof targets === "number") {
+          targetVal = targets;
+        }
+        if (typeof targets !== "number" && targets && targets[i] !== undefined) {
+          targetVal = targets[i];
+        }
+        const safeTarget = Math.max(SAFE_MIN_SCALE_Z, targetVal);
+        const current = THREE.MathUtils.lerp(startScales[i], safeTarget, eased);
+        ctx.motion.heightCurrent[i] = current;
+        ctx.motion.heightTargets[i] = safeTarget;
+        placeMunicipality(ctx.motion, i);
+      }
+
+      updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+      requestFrame(ctx);
+
+      if (typeof options.onProgress === "function") {
+        options.onProgress({ progress, eased });
+      }
+
+      if (progress < 1) {
+        requestFrameFn(step);
+        return;
+      }
+
+      if (typeof options.onComplete === "function") {
+        options.onComplete();
+      }
+      resolve();
+    }
+
+    requestFrameFn(step);
+  });
+}
+
+/**
+ * Interpolates height of a specific instance or municipality by index or code.
+ * @param {EngineContext} ctx
+ * @param {number | string} indexOrCode
+ * @param {number} targetScaleZ
+ * @param {any} [options]
+ * @returns {Promise<void>}
+ */
+function interpolateInstanceHeight(ctx, indexOrCode, targetScaleZ, options = {}) {
+  let index = -1;
+  if (typeof indexOrCode === "number") {
+    index = indexOrCode;
+  }
+  if (typeof indexOrCode === "string") {
+    const found = ctx.indexByCode.get(indexOrCode);
+    if (found !== undefined) {
+      index = found;
+    }
+  }
+
+  if (index < 0 || index >= ctx.municipalities.length) {
+    return Promise.resolve();
+  }
+
+  const safeTarget = Math.max(SAFE_MIN_SCALE_Z, targetScaleZ);
+  let durationMs = 0;
+  if (options.durationMs !== undefined) {
+    durationMs = options.durationMs;
+  }
+
+  if (durationMs <= 0) {
+    ctx.motion.heightTargets[index] = safeTarget;
+    if (options.immediate) {
+      ctx.motion.heightCurrent[index] = safeTarget;
+      placeMunicipality(ctx.motion, index);
+      updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+    }
+    if (!options.immediate) {
+      ctx.motion.isHeightMoving = true;
+    }
+    requestFrame(ctx);
+    if (typeof options.onComplete === "function") {
+      options.onComplete();
+    }
+    return Promise.resolve();
+  }
+
+  const startScale = ctx.motion.heightCurrent[index];
+  const requestFrameFn = resolveEngineRequestFrameFn(options.requestFrame);
+
+  return new Promise((resolve) => {
+    let startTime = /** @type {number | null} */ (null);
+
+    function step(/** @type {number} */ timestamp) {
+      if (startTime === null) {
+        startTime = timestamp;
+      }
+      const elapsed = timestamp - startTime;
+      const progress = THREE.MathUtils.clamp(elapsed / durationMs, 0, 1);
+      let eased = progress;
+      if (progress < 0.5) {
+        eased = 4 * progress * progress * progress;
+      }
+      if (progress >= 0.5) {
+        eased = 1 - Math.pow(-2 * progress + 2, 3) / 2;
+      }
+
+      const current = THREE.MathUtils.lerp(startScale, safeTarget, eased);
+      ctx.motion.heightCurrent[index] = current;
+      ctx.motion.heightTargets[index] = safeTarget;
+      placeMunicipality(ctx.motion, index);
+      updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+      requestFrame(ctx);
+
+      if (typeof options.onProgress === "function") {
+        options.onProgress({ progress, eased, scaleZ: current });
+      }
+
+      if (progress < 1) {
+        requestFrameFn(step);
+        return;
+      }
+
+      if (typeof options.onComplete === "function") {
+        options.onComplete();
+      }
+      resolve();
+    }
+
+    requestFrameFn(step);
+  });
+}
+
+/**
+ * Interpolates heights of all unselected municipalities to a target vertical scale (e.g. flattened).
+ * @param {EngineContext} ctx
+ * @param {number} [targetScaleZ]
+ * @param {any} [options]
+ * @returns {Promise<void>}
+ */
+function interpolateUnselectedHeights(ctx, targetScaleZ = SAFE_MIN_SCALE_Z, options = {}) {
+  const safeTarget = Math.max(SAFE_MIN_SCALE_Z, targetScaleZ);
+  const selectedSet = resolveSelectedSet(ctx, options);
+  let durationMs = 0;
+  if (options.durationMs !== undefined) {
+    durationMs = options.durationMs;
+  }
+
+  if (durationMs <= 0) {
+    for (let i = 0; i < ctx.municipalities.length; i += 1) {
+      if (selectedSet.has(i)) {
+        continue;
+      }
+      ctx.motion.heightTargets[i] = safeTarget;
+      if (options.immediate) {
+        ctx.motion.heightCurrent[i] = safeTarget;
+        placeMunicipality(ctx.motion, i);
+      }
+    }
+    if (!options.immediate) {
+      ctx.motion.isHeightMoving = true;
+    }
+    updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+    requestFrame(ctx);
+    if (typeof options.onComplete === "function") {
+      options.onComplete();
+    }
+    return Promise.resolve();
+  }
+
+  const startScales = new Float32Array(ctx.motion.heightCurrent);
+  const requestFrameFn = resolveEngineRequestFrameFn(options.requestFrame);
+
+  return new Promise((resolve) => {
+    let startTime = /** @type {number | null} */ (null);
+
+    function step(/** @type {number} */ timestamp) {
+      if (startTime === null) {
+        startTime = timestamp;
+      }
+      const elapsed = timestamp - startTime;
+      const progress = THREE.MathUtils.clamp(elapsed / durationMs, 0, 1);
+      let eased = progress;
+      if (progress < 0.5) {
+        eased = 4 * progress * progress * progress;
+      }
+      if (progress >= 0.5) {
+        eased = 1 - Math.pow(-2 * progress + 2, 3) / 2;
+      }
+
+      for (let i = 0; i < ctx.municipalities.length; i += 1) {
+        if (selectedSet.has(i)) {
+          continue;
+        }
+        const current = THREE.MathUtils.lerp(startScales[i], safeTarget, eased);
+        ctx.motion.heightCurrent[i] = current;
+        ctx.motion.heightTargets[i] = safeTarget;
+        placeMunicipality(ctx.motion, i);
+      }
+
+      updateLineHeights(ctx.view.borders, ctx.motion, BORDER_LIFT_SHARE);
+      requestFrame(ctx);
+
+      if (typeof options.onProgress === "function") {
+        options.onProgress({ progress, eased });
+      }
+
+      if (progress < 1) {
+        requestFrameFn(step);
+        return;
+      }
+
+      if (typeof options.onComplete === "function") {
+        options.onComplete();
+      }
+      resolve();
+    }
+
+    requestFrameFn(step);
+  });
 }
 
 /**
