@@ -396,6 +396,33 @@ export async function buildUfDataset({
     return false;
   }
 
+  const meshRawFile = await findAvailableStateMeshFile(rawDir, ufCode, quality);
+  let meshDoc = null;
+  /** @type {Set<string> | null} */
+  let validMeshCodes = null;
+  if (meshRawFile) {
+    const meshContent = await readFile(path.join(rawDir, meshRawFile), "utf8");
+    const rawTopology = JSON.parse(meshContent);
+    const projected = projectTopology(rawTopology);
+    const geometries = readSourceGeometries(projected)
+      .map((geom) => ({
+        type: geom.type,
+        id: readGeometryCode(geom),
+        arcs: geom.arcs,
+      }))
+      .sort((a, b) => compareText(a.id, b.id));
+
+    validMeshCodes = new Set(geometries.map((geom) => geom.id));
+
+    meshDoc = {
+      type: "Topology",
+      meta: createMeta([createUfSourceStub(meshRawFile, ufInfo, quality)], raw),
+      transform: projected.transform,
+      objects: { municipalities: { type: "GeometryCollection", geometries } },
+      arcs: projected.arcs,
+    };
+  }
+
   const columns = [
     "code",
     "name",
@@ -407,7 +434,14 @@ export async function buildUfDataset({
     "gdpThousandBrl",
   ];
 
-  const rows = munRows.map((mun) => {
+  const filteredMunRows = munRows.filter((mun) => {
+    if (!validMeshCodes) {
+      return true;
+    }
+    return validMeshCodes.has(String(mun["municipio-id"]));
+  });
+
+  const rows = filteredMunRows.map((mun) => {
     const code = String(mun["municipio-id"]);
     const name = mun["municipio-nome"];
     const regionCode = String(mun["regiao-intermediaria-id"]);
@@ -436,7 +470,7 @@ export async function buildUfDataset({
   /** @type {Map<string, string>} */
   const govRegionLabels = new Map();
 
-  for (const mun of munRows) {
+  for (const mun of filteredMunRows) {
     const regCode = String(mun["regiao-intermediaria-id"]);
     const regName = mun["regiao-intermediaria-nome"];
     if (!regionLabels.has(regCode)) {
@@ -462,29 +496,6 @@ export async function buildUfDataset({
     regions,
     governmentRegions,
   };
-
-  const meshRawFile = await findAvailableStateMeshFile(rawDir, ufCode, quality);
-  let meshDoc = null;
-  if (meshRawFile) {
-    const meshContent = await readFile(path.join(rawDir, meshRawFile), "utf8");
-    const rawTopology = JSON.parse(meshContent);
-    const projected = projectTopology(rawTopology);
-    const geometries = readSourceGeometries(projected)
-      .map((geom) => ({
-        type: geom.type,
-        id: readGeometryCode(geom),
-        arcs: geom.arcs,
-      }))
-      .sort((a, b) => compareText(a.id, b.id));
-
-    meshDoc = {
-      type: "Topology",
-      meta: createMeta([createUfSourceStub(meshRawFile, ufInfo, quality)], raw),
-      transform: projected.transform,
-      objects: { municipalities: { type: "GeometryCollection", geometries } },
-      arcs: projected.arcs,
-    };
-  }
 
   const dirByCode = path.join(dataDir, "ufs", ufCode);
   const dirBySigla = path.join(dataDir, "ufs", ufSiglaLower);
