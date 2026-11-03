@@ -307,12 +307,15 @@ export function normalizeBox2(input) {
  * Computes pan and zoom for a bounding box.
  * @param {THREE.Box2 | THREE.Box3 | any} boxInput
  * @param {THREE.Vector3} mapSize in world units
- * @param {{ isWorldUnits?: boolean }} [options]
+ * @param {{ isWorldUnits?: boolean; isWholeMap?: boolean }} [options]
  * @returns {{ pan: THREE.Vector3; zoom: number }}
  */
 export function readBoxFraming(boxInput, mapSize, options = {}) {
   const box = normalizeBox2(boxInput);
   if (!box) {
+    return { pan: new THREE.Vector3(0, 0, 0), zoom: 1 };
+  }
+  if (options.isWholeMap) {
     return { pan: new THREE.Vector3(0, 0, 0), zoom: 1 };
   }
   const center = box.getCenter(new THREE.Vector2());
@@ -462,6 +465,7 @@ function resolveRequestFrameFn(customRequestFrame) {
  *   mapSize: THREE.Vector3;
  *   durationMs?: number;
  *   isWorldUnits?: boolean;
+ *   isWholeMap?: boolean;
  *   onProgress?: (state: { pan: THREE.Vector3; zoom: number; progress: number; eased: number }) => void;
  *   onComplete?: (state: { pan: THREE.Vector3; zoom: number }) => void;
  *   requestFrame?: (callback: (time: number) => void) => number;

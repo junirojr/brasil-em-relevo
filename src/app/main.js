@@ -195,8 +195,62 @@ export async function bootApplication(documentRef = document, windowRef = window
   let currentGeo = geo;
   /** @type {any} */
   let nationalBounds = null;
+  const nationalUfBounds = new Map();
+
+  /**
+   * @param {any} targetGeo
+   */
+  function recordNationalBounds(targetGeo) {
+    if (!targetGeo) {
+      return;
+    }
+    nationalBounds = targetGeo.mapBounds;
+    for (let i = 0; i < targetGeo.municipalities.length; i += 1) {
+      const m = targetGeo.municipalities[i];
+      if (m && m.bounds) {
+        nationalUfBounds.set(m.code, m.bounds);
+        const sigla = resolveUfSigla(m.code);
+        if (sigla) {
+          nationalUfBounds.set(sigla, m.bounds);
+          nationalUfBounds.set(sigla.toLowerCase(), m.bounds);
+        }
+        const code = resolveUfCode(m.code);
+        if (code) {
+          nationalUfBounds.set(code, m.bounds);
+        }
+      }
+    }
+  }
+
+  /**
+   * @param {any} ufKey
+   * @param {any} [nationalGeoRef]
+   */
+  function findNationalUfBounds(ufKey, nationalGeoRef) {
+    if (ufKey && nationalUfBounds.has(ufKey)) {
+      return nationalUfBounds.get(ufKey);
+    }
+    const sigla = resolveUfSigla(ufKey);
+    if (sigla && nationalUfBounds.has(sigla)) {
+      return nationalUfBounds.get(sigla);
+    }
+    const code = resolveUfCode(ufKey);
+    if (code && nationalUfBounds.has(code)) {
+      return nationalUfBounds.get(code);
+    }
+    if (nationalGeoRef && nationalGeoRef.municipalities) {
+      for (let i = 0; i < nationalGeoRef.municipalities.length; i += 1) {
+        const m = nationalGeoRef.municipalities[i];
+        if (m.code === ufKey || m.code === sigla || m.code === code) {
+          return m.bounds;
+        }
+      }
+    }
+    return null;
+  }
+
   if (!initialUf) {
-    nationalBounds = geo.mapBounds;
+    recordNationalBounds(geo);
   }
 
   const navigationContainer = documentRef.getElementById("navigation-container");
@@ -264,12 +318,12 @@ export async function bootApplication(documentRef = document, windowRef = window
         }
         const nextGeo = buildMunicipalities(nextData.mesh);
         currentGeo = nextGeo;
-        if (cleanUf === null && !nationalBounds) {
-          nationalBounds = nextGeo.mapBounds;
+        if (cleanUf === null) {
+          recordNationalBounds(nextGeo);
         }
         if (engine) {
           engine.replaceMesh(nextGeo, { immediate: true });
-          engine.frameBoundsNow(nextGeo.mapBounds);
+          engine.frameBoundsNow(nextGeo.mapBounds, { isWholeMap: true });
         }
         store.dispatch(changeData(nextData));
         store.dispatch(changeTerritory(cleanUf));
@@ -295,6 +349,7 @@ export async function bootApplication(documentRef = document, windowRef = window
     if (currentActiveUf === null && cleanUf !== null) {
       stageView.setStatus("Carregando território...");
       try {
+        recordNationalBounds(currentGeo);
         const targetCode = resolveUfCode(cleanUf);
         const targetSigla = resolveUfSigla(cleanUf);
         let targetUnit = null;
@@ -315,7 +370,7 @@ export async function bootApplication(documentRef = document, windowRef = window
         let flattenOthersPromise = Promise.resolve();
         if (engine) {
           cameraFlightPromise = engine.transitionCameraToBounds(targetBounds, {
-            durationMs: 600,
+            durationMs: 500,
           });
           /** @type {(string | number)[]} */
           let selectedIndexes = [];
@@ -323,7 +378,7 @@ export async function bootApplication(documentRef = document, windowRef = window
             selectedIndexes = [targetUnit.code];
           }
           flattenOthersPromise = engine.interpolateUnselectedHeights(0.001, {
-            durationMs: 600,
+            durationMs: 450,
             selectedIndexes,
           });
         }
@@ -342,9 +397,12 @@ export async function bootApplication(documentRef = document, windowRef = window
         currentGeo = nextGeo;
 
         if (engine) {
-          engine.replaceMesh(nextGeo, { immediate: true });
-          engine.flattenHeights({ immediate: true, scaleZ: 0.001 });
-          engine.frameBoundsNow(nextGeo.mapBounds);
+          engine.replaceMesh(nextGeo, {
+            immediate: true,
+            initialScaleZ: 0.001,
+            initialCamera: { pan: { x: 0, y: 0, z: 0 }, zoom: 1.15 },
+            resetView: false,
+          });
         }
 
         territory = createTerritory({
@@ -359,13 +417,18 @@ export async function bootApplication(documentRef = document, windowRef = window
         store.dispatch(changeTerritory(cleanUf));
 
         if (engine) {
+          const cameraAdjustPromise = engine.transitionCameraToBounds(nextGeo.mapBounds, {
+            durationMs: 300,
+            isWholeMap: true,
+          });
           /** @type {number | Float32Array} */
           let targetHeights = 1.0;
           const currentTab = store.getState().tab;
           if (currentTab !== "first-round" && currentTab !== "second-round") {
             targetHeights = selectors.selectHeightTargets(store.getState());
           }
-          await engine.interpolateHeights(targetHeights, { durationMs: 400 });
+          const heightsRisePromise = engine.interpolateHeights(targetHeights, { durationMs: 400 });
+          await Promise.all([cameraAdjustPromise, heightsRisePromise]);
         }
 
         syncUrlState(windowRef, {
@@ -387,9 +450,10 @@ export async function bootApplication(documentRef = document, windowRef = window
     if (currentActiveUf !== null && cleanUf === null) {
       stageView.setStatus("Retornando ao Brasil...");
       try {
+        const previousUf = currentActiveUf;
         let flattenPromise = Promise.resolve();
         if (engine) {
-          flattenPromise = engine.flattenHeights({ durationMs: 400, scaleZ: 0.001 });
+          flattenPromise = engine.flattenHeights({ durationMs: 350, scaleZ: 0.001 });
         }
         const dataPromise = loadTerritoryData(null, fetch, (file) => {
           stageView.setStatus(`Carregando ${file}...`);
@@ -398,12 +462,21 @@ export async function bootApplication(documentRef = document, windowRef = window
         const [_, nextData] = await Promise.all([flattenPromise, dataPromise]);
         const nextGeo = buildMunicipalities(nextData.mesh);
         currentGeo = nextGeo;
-        nationalBounds = nextGeo.mapBounds;
+        recordNationalBounds(nextGeo);
+
+        const ufBounds = findNationalUfBounds(previousUf, nextGeo);
 
         if (engine) {
-          engine.replaceMesh(nextGeo, { immediate: true });
-          engine.flattenHeights({ immediate: true, scaleZ: 0.001 });
-          await engine.transitionCameraToBounds(nextGeo.mapBounds, { durationMs: 600 });
+          let initialBounds = nextGeo.mapBounds;
+          if (ufBounds) {
+            initialBounds = ufBounds;
+          }
+          engine.replaceMesh(nextGeo, {
+            immediate: true,
+            initialScaleZ: 0.001,
+            bounds: initialBounds,
+            resetView: false,
+          });
         }
 
         territory = createTerritory({
@@ -418,13 +491,18 @@ export async function bootApplication(documentRef = document, windowRef = window
         store.dispatch(changeTerritory(null));
 
         if (engine) {
+          const cameraFlightPromise = engine.transitionCameraToBounds(nextGeo.mapBounds, {
+            durationMs: 600,
+            isWholeMap: true,
+          });
           /** @type {number | Float32Array} */
           let targetHeights = 1.0;
           const currentTab = store.getState().tab;
           if (currentTab !== "first-round" && currentTab !== "second-round") {
             targetHeights = selectors.selectHeightTargets(store.getState());
           }
-          await engine.interpolateHeights(targetHeights, { durationMs: 400 });
+          const heightsRisePromise = engine.interpolateHeights(targetHeights, { durationMs: 500 });
+          await Promise.all([cameraFlightPromise, heightsRisePromise]);
         }
 
         syncUrlState(windowRef, {
@@ -447,7 +525,7 @@ export async function bootApplication(documentRef = document, windowRef = window
     try {
       let flattenPromise = Promise.resolve();
       if (engine) {
-        flattenPromise = engine.flattenHeights({ durationMs: 400, scaleZ: 0.001 });
+        flattenPromise = engine.flattenHeights({ durationMs: 350, scaleZ: 0.001 });
       }
       const dataPromise = loadTerritoryData(cleanUf, fetch, (file) => {
         stageView.setStatus(`Carregando ${file}...`);
@@ -458,9 +536,12 @@ export async function bootApplication(documentRef = document, windowRef = window
       currentGeo = nextGeo;
 
       if (engine) {
-        engine.replaceMesh(nextGeo, { immediate: true });
-        engine.flattenHeights({ immediate: true, scaleZ: 0.001 });
-        engine.frameBoundsNow(nextGeo.mapBounds);
+        engine.replaceMesh(nextGeo, {
+          immediate: true,
+          initialScaleZ: 0.001,
+          initialCamera: { pan: { x: 0, y: 0, z: 0 }, zoom: 1.15 },
+          resetView: false,
+        });
       }
 
       territory = createTerritory({
@@ -475,13 +556,18 @@ export async function bootApplication(documentRef = document, windowRef = window
       store.dispatch(changeTerritory(cleanUf));
 
       if (engine) {
+        const cameraAdjustPromise = engine.transitionCameraToBounds(nextGeo.mapBounds, {
+          durationMs: 300,
+          isWholeMap: true,
+        });
         /** @type {number | Float32Array} */
         let targetHeights = 1.0;
         const currentTab = store.getState().tab;
         if (currentTab !== "first-round" && currentTab !== "second-round") {
           targetHeights = selectors.selectHeightTargets(store.getState());
         }
-        await engine.interpolateHeights(targetHeights, { durationMs: 400 });
+        const heightsRisePromise = engine.interpolateHeights(targetHeights, { durationMs: 400 });
+        await Promise.all([cameraAdjustPromise, heightsRisePromise]);
       }
 
       syncUrlState(windowRef, {

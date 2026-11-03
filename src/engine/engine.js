@@ -176,15 +176,16 @@ const OUTLINE_LIFT_SHARE = 1;
  *   readSelectionOutline: () => any;
  *   frame: (indexes: number[]) => void;
  *   frameNow: (indexes: number[]) => void;
- *   frameBounds: (bounds: any, options?: { immediate?: boolean; isWorldUnits?: boolean; durationMs?: number }) => any;
- *   frameBoundsNow: (bounds: any, options?: { isWorldUnits?: boolean }) => void;
+ *   frameBounds: (bounds: any, options?: { immediate?: boolean; isWorldUnits?: boolean; isWholeMap?: boolean; durationMs?: number }) => any;
+ *   frameBoundsNow: (bounds: any, options?: { isWorldUnits?: boolean; isWholeMap?: boolean }) => void;
+ *   setCameraBoundsNow?: (bounds: any, options?: { isWorldUnits?: boolean; isWholeMap?: boolean }) => void;
  *   transitionCameraToBounds: (bounds: any, options?: any) => Promise<any>;
  *   flattenHeights: (options?: any) => Promise<void>;
  *   interpolateHeights: (targets: any, options?: any) => Promise<void>;
  *   interpolateInstanceHeight: (indexOrCode: number | string, targetScaleZ: number, options?: any) => Promise<void>;
  *   interpolateUnselectedHeights: (targetScaleZ?: number, options?: any) => Promise<void>;
- *   replaceMesh: (geometry: any, options?: { collectionName?: string; bounds?: any; frame?: boolean; immediate?: boolean; resetView?: boolean; isWorldUnits?: boolean }) => void;
- *   setGeometry: (geometry: any, options?: { collectionName?: string; bounds?: any; frame?: boolean; immediate?: boolean; resetView?: boolean; isWorldUnits?: boolean }) => void;
+ *   replaceMesh: (geometry: any, options?: { collectionName?: string; bounds?: any; frame?: boolean; immediate?: boolean; resetView?: boolean; isWorldUnits?: boolean; initialScaleZ?: number; initialCamera?: any }) => void;
+ *   setGeometry: (geometry: any, options?: { collectionName?: string; bounds?: any; frame?: boolean; immediate?: boolean; resetView?: boolean; isWorldUnits?: boolean; initialScaleZ?: number; initialCamera?: any }) => void;
  *   zoomStep: (direction: number, screenPoint?: { x: number; y: number }) => void;
  *   resetView: () => void;
  *   readCamera: () => {
@@ -301,6 +302,8 @@ export function createEngine(options) {
     frameNow: (indexes) => frameIndexes(ctx, indexes),
     frameBounds: (bounds, options) => frameBounds(ctx, bounds, options),
     frameBoundsNow: (bounds, options) => frameBounds(ctx, bounds, { ...options, immediate: true }),
+    setCameraBoundsNow: (bounds, options) =>
+      frameBounds(ctx, bounds, { ...options, immediate: true }),
     transitionCameraToBounds: (bounds, options) => transitionCameraToBounds(ctx, bounds, options),
     flattenHeights: (options) => flattenHeights(ctx, options),
     interpolateHeights: (targets, options) => interpolateHeights(ctx, targets, options),
@@ -1112,6 +1115,10 @@ function frameBounds(ctx, bounds, options = {}) {
   setZoomTarget(ctx, framing.zoom);
   ctx.tiltTarget.set(0.12, -0.22);
   if (ctx.motion.isMotionReduced || options.immediate) {
+    ctx.zoomState.current = framing.zoom;
+    ctx.zoomState.target = framing.zoom;
+    ctx.view.camera.zoom = framing.zoom;
+    ctx.view.camera.updateProjectionMatrix();
     ctx.orbit.pan.copy(ctx.panTarget);
     positionCamera(ctx.view.camera, ctx.orbit);
   }
@@ -1165,13 +1172,29 @@ function resolveEngineRequestFrameFn(customRequestFrame) {
  * @returns {Promise<{ pan: THREE.Vector3; zoom: number; progress: number; eased: number }>}
  */
 function transitionCameraToBounds(ctx, bounds, options = {}) {
-  const from = {
+  let from = {
     pan: ctx.orbit.pan.clone(),
     zoom: ctx.zoomState.current,
   };
+  if (options.from) {
+    from = options.from;
+  }
+  if (options.fromBounds) {
+    from = readBoxFraming(options.fromBounds, ctx.view.mapSize, options);
+    ctx.orbit.pan.copy(from.pan);
+    ctx.panTarget.copy(from.pan);
+    ctx.zoomState.current = from.zoom;
+    ctx.zoomState.target = from.zoom;
+    ctx.view.camera.zoom = from.zoom;
+    ctx.view.camera.updateProjectionMatrix();
+    positionCamera(ctx.view.camera, ctx.orbit);
+  }
   let durationMs = 600;
   if (options.durationMs !== undefined) {
     durationMs = options.durationMs;
+  }
+  if (ctx.motion.isMotionReduced) {
+    durationMs = 0;
   }
   const requestFrameFn = resolveEngineRequestFrameFn(options.requestFrame);
 
@@ -1181,6 +1204,7 @@ function transitionCameraToBounds(ctx, bounds, options = {}) {
     mapSize: ctx.view.mapSize,
     durationMs,
     isWorldUnits: options.isWorldUnits,
+    isWholeMap: options.isWholeMap,
     requestFrame: requestFrameFn,
     getTime: options.getTime,
     onProgress: (state) => {
@@ -1550,6 +1574,8 @@ function interpolateUnselectedHeights(ctx, targetScaleZ = SAFE_MIN_SCALE_Z, opti
  *   immediate?: boolean;
  *   resetView?: boolean;
  *   isWorldUnits?: boolean;
+ *   initialScaleZ?: number;
+ *   initialCamera?: any;
  * }} [options]
  */
 function replaceMesh(ctx, geometryInput, options = {}) {
@@ -1597,6 +1623,15 @@ function replaceMesh(ctx, geometryInput, options = {}) {
   ctx.motion = createMapMotion(newGeometry.plate, newGeometry.municipalities);
   ctx.motion.isMotionReduced = wasMotionReduced;
 
+  if (options.initialScaleZ !== undefined) {
+    const initZ = Math.max(SAFE_MIN_SCALE_Z, options.initialScaleZ);
+    ctx.motion.heightCurrent.fill(initZ);
+    ctx.motion.heightTargets.fill(initZ);
+    for (let i = 0; i < ctx.municipalities.length; i += 1) {
+      placeMunicipality(ctx.motion, i);
+    }
+  }
+
   new THREE.Box3().setFromObject(newGeometry.plate).getSize(ctx.view.mapSize);
   if (ctx.view.ground && ctx.view.ground.geometry) {
     ctx.view.ground.geometry.dispose();
@@ -1631,15 +1666,30 @@ function replaceMesh(ctx, geometryInput, options = {}) {
     ctx.orbit.viewAngleDegrees,
   );
 
+  if (options.initialCamera) {
+    let panZ = 0;
+    if (options.initialCamera.pan.z !== undefined) {
+      panZ = options.initialCamera.pan.z;
+    }
+    ctx.orbit.pan.set(options.initialCamera.pan.x, options.initialCamera.pan.y, panZ);
+    ctx.panTarget.copy(ctx.orbit.pan);
+    ctx.zoomState.current = options.initialCamera.zoom;
+    ctx.zoomState.target = options.initialCamera.zoom;
+    ctx.view.camera.zoom = options.initialCamera.zoom;
+    ctx.view.camera.updateProjectionMatrix();
+    positionCamera(ctx.view.camera, ctx.orbit);
+  }
   if (options.bounds) {
     frameBounds(ctx, options.bounds, options);
   }
-  if (!options.bounds) {
+  if (!options.bounds && !options.initialCamera) {
     if (options.resetView !== false) {
       if (options.immediate) {
         ctx.panTarget.set(0, 0, 0);
         ctx.zoomState.target = 1;
         ctx.zoomState.current = 1;
+        ctx.view.camera.zoom = 1;
+        ctx.view.camera.updateProjectionMatrix();
         ctx.orbit.pan.set(0, 0, 0);
         positionCamera(ctx.view.camera, ctx.orbit);
       }

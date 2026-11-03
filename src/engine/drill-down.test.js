@@ -393,3 +393,118 @@ test("DRL-10 engine.interpolateUnselectedHeights and interpolateInstanceHeight m
 
   engine.destroy();
 });
+
+test("DRL-11 engine.replaceMesh with initialScaleZ initializes heights at flat scale", () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const renderer = createMockRenderer();
+  const canvas = createMockCanvas();
+
+  const engine = createEngine({
+    canvas: /** @type {any} */ (canvas),
+    renderer: /** @type {any} */ (renderer),
+    geometry: statesGeometry,
+    palette: TEST_PALETTE,
+  });
+
+  const nextTopology = createStatesTopologyFixture();
+  const nextGeometry = buildUnits(nextTopology, "states");
+  engine.replaceMesh(nextGeometry, { immediate: true, initialScaleZ: 0.001, resetView: false });
+
+  const sp = engine.inspect(0);
+  assert.ok(sp);
+  assert.ok(Math.abs(sp.heightCurrent - 0.001) < 0.0001);
+  assert.ok(Math.abs(sp.heightTarget - 0.001) < 0.0001);
+
+  engine.destroy();
+});
+
+test("DRL-12 engine.replaceMesh with initialCamera sets pan and zoom without reset jump", () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const renderer = createMockRenderer();
+  const canvas = createMockCanvas();
+
+  const engine = createEngine({
+    canvas: /** @type {any} */ (canvas),
+    renderer: /** @type {any} */ (renderer),
+    geometry: statesGeometry,
+    palette: TEST_PALETTE,
+  });
+
+  const nextTopology = createStatesTopologyFixture();
+  const nextGeometry = buildUnits(nextTopology, "states");
+  engine.replaceMesh(nextGeometry, {
+    immediate: true,
+    initialCamera: { pan: { x: 5, y: -10, z: 0 }, zoom: 1.25 },
+    resetView: false,
+  });
+
+  const cam = engine.readCamera();
+  assert.equal(cam.zoom, 1.25);
+  assert.equal(cam.panX, 5);
+  assert.equal(cam.panY, -10);
+
+  engine.destroy();
+});
+
+test("DRL-13 engine.frameBoundsNow synchronously positions camera zoom and pan", () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const renderer = createMockRenderer();
+  const canvas = createMockCanvas();
+
+  const engine = createEngine({
+    canvas: /** @type {any} */ (canvas),
+    renderer: /** @type {any} */ (renderer),
+    geometry: statesGeometry,
+    palette: TEST_PALETTE,
+  });
+
+  const subBox = new THREE.Box2(new THREE.Vector2(-2, -2), new THREE.Vector2(2, 2));
+  engine.frameBoundsNow(subBox);
+
+  const cam = engine.readCamera();
+  assert.ok(cam.zoom > 1);
+
+  engine.destroy();
+});
+
+test("DRL-14 engine.transitionCameraToBounds supports fromBounds for smooth recoil flight", async () => {
+  const statesTopology = createStatesTopologyFixture();
+  const statesGeometry = buildUnits(statesTopology, "states");
+  const renderer = createMockRenderer();
+  const canvas = createMockCanvas();
+
+  const engine = createEngine({
+    canvas: /** @type {any} */ (canvas),
+    renderer: /** @type {any} */ (renderer),
+    geometry: statesGeometry,
+    palette: TEST_PALETTE,
+  });
+
+  const ufBox = new THREE.Box2(new THREE.Vector2(-5, -5), new THREE.Vector2(5, 5));
+  const fullBox = new THREE.Box2(new THREE.Vector2(-50, -50), new THREE.Vector2(50, 50));
+
+  let simulatedTime = 1000;
+  const simulatedGetTime = () => simulatedTime;
+  const simulatedRequestFrame = (/** @type {any} */ callback) => {
+    simulatedTime += 300;
+    setTimeout(() => callback(simulatedTime), 1);
+    return 1;
+  };
+
+  const finalState = await engine.transitionCameraToBounds(fullBox, {
+    fromBounds: ufBox,
+    durationMs: 600,
+    getTime: simulatedGetTime,
+    requestFrame: simulatedRequestFrame,
+  });
+
+  assert.ok(finalState);
+  assert.equal(finalState.progress, 1);
+  const cam = engine.readCamera();
+  assert.equal(cam.zoom, 1);
+
+  engine.destroy();
+});
